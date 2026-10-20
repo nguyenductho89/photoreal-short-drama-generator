@@ -49,6 +49,7 @@ if CFG["ffmpeg"] == "ffmpeg" and not shutil.which("ffmpeg") and imageio_ffmpeg:
     except RuntimeError:   # 這個平台沒有附 ffmpeg：維持原設定，開工檢查會報 ❌ 並說明怎麼補
         pass
 M = CFG["models"]
+BACKEND = CFG.get("backend", "local")   # "local"＝本機 ComfyUI；"runpod"＝RunPod Serverless（見 scripts/rp.py、runpod/README.md）
 BASE = CFG["comfy_url"]
 OUT = os.path.join(CFG["comfy_dir"], "output")
 INP = os.path.join(CFG["comfy_dir"], "input")
@@ -124,19 +125,90 @@ def h3_video_facts(graph):
             "n_refs": len(refs) if mode == "ref" else len(images)}
 
 
+_rp_free_next = False   # backend=runpod：free() 設 True；下一個真的送出的工作帶 free_first，之後清成 False（見 free()、_post）
+
+
 def _post(path, obj, job=None):
-    """H3 影片只能經佇列送：佇列送出前查過「掛的檔都在 已核可/」才帶 job 編號來；沒有 job 的 H3 影片（comfy.run、直接送件）不送"""
+    """H3 影片只能經佇列送：佇列送出前查過「掛的檔都在 已核可/」才帶 job 編號來；沒有 job 的 H3 影片（comfy.run、直接送件）不送。
+    backend=runpod：/prompt 不送本機、改送 RunPod（見 rp.submit），回傳的 prompt_id 其實是 RunPod 的 job id，
+    之後 history_entry／佇列.advance 認的也是這個 id，不用管它本來是誰的號碼。"""
     if path == "/prompt" and job is None and h3_video_facts(obj["prompt"]):
         msg = "H3 影片要經佇列送（佇列.add，由 wait 送出）：送出前只查掛的檔都在 已核可/ 裡；comfy.run 和直接送件都不送 H3 影片"
         raise GateBlocked({"ok": False, "reasons": ["NOT_VIA_QUEUE"], "messages": [msg], "message": msg})
+    if BACKEND == "runpod":
+        global _rp_free_next
+        import rp
+        if path == "/prompt":
+            free_first, _rp_free_next = _rp_free_next, False
+            pid = rp.submit(obj["prompt"], free_first=free_first)
+            return json.dumps({"prompt_id": pid}).encode("utf-8")
+        if path == "/free":
+            _rp_free_next = True
+            return b"{}"
+        raise NotImplementedError(f"backend=runpod 不支援 {path}")
     req = urllib.request.Request(BASE + path, data=json.dumps(obj).encode("utf-8"),
                                  headers={"Content-Type": "application/json"})
     return urllib.request.urlopen(req, timeout=60).read()
 
 
 def free():
-    """換模型家族前清顯存（佇列空的時候才呼叫）"""
+    """換模型家族前清顯存（佇列空的時候才呼叫）。backend=runpod 沒有常駐的伺服器可以「現在」清，
+    只能讓下一個真正送出的工作帶 free_first（那個 worker 剛好是熱的才有意義，冷的本來就沒載模型）"""
     _post("/free", {"unload_models": True, "free_memory": True})
+
+
+def cancel(pid):
+    """取消一個已經送出的工作（佇列.cancel 用；pid＝comfy._post 回的那個號碼，不是帳本的 job id）"""
+    if BACKEND == "runpod":
+        import rp
+        rp.cancel(pid)
+        return
+    try:
+        q = json.load(urllib.request.urlopen(f"{BASE}/queue", timeout=15))
+        if pid in {x[1] for x in q["queue_running"]}:
+            _post("/interrupt", {"prompt_id": pid})
+        else:
+            _post("/queue", {"delete": [pid]})
+    except Exception as e:
+        print(f"⚠️ 取消 {pid} 失敗：{e}")
+
+
+def history_entry(pid):
+    """這個 pid 目前的 /history 項目（還在跑就 None）。backend=local 直接問 ComfyUI；
+    backend=runpod 問 RunPod 的工作狀態（rp.get_result，結果會在本機快取一份，RunPod 的 30 分鐘過期不用管）"""
+    if BACKEND == "runpod":
+        import rp
+        return rp.get_result(pid)
+    try:
+        h = json.load(urllib.request.urlopen(f"{BASE}/history/{pid}", timeout=15))
+    except Exception:
+        return None
+    return h.get(pid)
+
+
+_OBJECT_INFO_CACHE = None
+
+
+def _object_info_cache():
+    global _OBJECT_INFO_CACHE
+    if _OBJECT_INFO_CACHE is None:
+        path = os.path.join(HERE, "object_info.runpod.json")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"{path}（backend=runpod 要先跑一次 python rp.py object_info，要先 python rp.py up 叫醒 worker）")
+        _OBJECT_INFO_CACHE = read_json(path)
+    return _OBJECT_INFO_CACHE
+
+
+def object_info(ct):
+    """跟 GET {BASE}/object_info/{ct} 一樣的形狀：{ct: {...}}，節點不存在就 {}。
+    backend=runpod 讀 rp.py object_info 存的快取，不是問真的在跑的伺服器（RunPod 沒有常駐、能直接問的 HTTP 伺服器）"""
+    if BACKEND == "runpod":
+        cache = _object_info_cache()
+        return {ct: cache[ct]} if ct in cache else {}
+    try:
+        return json.load(urllib.request.urlopen(f"{BASE}/object_info/{ct}", timeout=10))
+    except urllib.error.HTTPError:
+        return {}
 
 
 def graph_facts(graph):
@@ -207,20 +279,17 @@ def outputs(entry):
 
 
 def wait_for(job_id, pid, dests, timeout=3600, meta=None):
-    """等一個已經在 ComfyUI 佇列裡的工作（用 prompt_id）跑完，輸出依順序複製到 dests"""
+    """等一個已經送出的工作（用 prompt_id／RunPod job id）跑完，輸出依順序複製到 dests"""
     t0 = time.time()
     while time.time() - t0 < timeout:
-        try:
-            h = json.load(urllib.request.urlopen(f"{BASE}/history/{pid}", timeout=15))
-        except Exception:
-            h = {}
-        if pid in h:
+        entry = history_entry(pid)
+        if entry is not None:
             el = round(time.time() - t0)
-            st = h[pid].get("status", {})
+            st = entry.get("status", {})
             if st.get("status_str") != "success":
                 err = "gen error: " + json.dumps(st.get("messages", []), ensure_ascii=False)[-1500:]
                 log({"job": job_id, "prompt_id": pid, "error": err, "sec": el, **(meta or {})}); return [], err, el
-            files = outputs(h[pid])
+            files = outputs(entry)
             got = []
             for src, dst in zip(files, dests):
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -235,9 +304,10 @@ def wait_for(job_id, pid, dests, timeout=3600, meta=None):
 # ---------- 圖 ----------
 
 def qwen_t2i(prompt, seed, prefix, w=1920, h=1088, steps=25):
-    """Qwen-Image 2.1 文字生圖（照官方範本：euler、simple、cfg 1；主模型用 GGUF 檔，ComfyUI-GGUF 載入）"""
+    """Qwen-Image 2.1 文字生圖（照官方範本：euler、simple、cfg 1；主模型用 Comfy-Org 官方 int8_convrot safetensors，
+    UNETLoader 載入——跟 h3_ref2va 同一種量化檔、同一個載入節點，已驗證能跑；GGUF 第三方量化檔測過不相容，見 CHANGELOG）"""
     return {
-        "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": M["qwen_image"]}},
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": M["qwen_image"], "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": M["qwen_text_encoder"],
                                                      "type": "qwen_image", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": M["qwen_vae"]}},
@@ -262,10 +332,11 @@ def stage_input(src, name, sub="drama"):
 
 
 def qwen_edit(prompt, image_names, seed, prefix, size=None, resolution=0, steps=25):
-    """Qwen-Image 2.1 編輯模式（照官方範本，主模型用 GGUF 檔）。image_names 依序＝<image1>、<image2>…；<image1> 是畫布、構圖跟它走（合成新畫面放場景卡或空景板，角色、道具放後面）；
+    """Qwen-Image 2.1 編輯模式（照官方範本，主模型用 Comfy-Org 官方 int8_convrot safetensors，UNETLoader 載入）。
+    image_names 依序＝<image1>、<image2>…；<image1> 是畫布、構圖跟它走（合成新畫面放場景卡或空景板，角色、道具放後面）；
     size=None 時輸出跟著 image_1；size=(w,h) 時等於範本的 custom_size 開啟。"""
     g = {
-        "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": M["qwen_image"]}},
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": M["qwen_image"], "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": M["qwen_text_encoder"],
                                                      "type": "qwen_image", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": M["qwen_vae"]}},
@@ -433,9 +504,10 @@ def check_graph(g):
                     problems.append(f"#{nid} {node['class_type']}.{key} 指到不存在的節點 #{v[0]}")
     for ct in sorted({n["class_type"] for n in g.values()}):
         try:
-            info = json.load(urllib.request.urlopen(f"{BASE}/object_info/{ct}", timeout=10))[ct]
+            info = object_info(ct)[ct]
         except Exception as e:
-            problems.append(f"查不到 {ct} 的定義（ComfyUI 沒開？）：{e}")
+            hint = "ComfyUI 沒開？" if BACKEND != "runpod" else "先跑 python rp.py object_info 存快取？"
+            problems.append(f"查不到 {ct} 的定義（{hint}）：{e}")
             continue
         req, opt = info["input"].get("required", {}), info["input"].get("optional", {})
         n_out[ct] = len(info.get("output", []))
@@ -466,7 +538,7 @@ VOICE_TMPL = (
     "integrated_multimodal_description: [Shot 1] Realistic live-action footage in vertical 9:16 portrait framing, "
     "as one single continuous shot. A static close shot of one person sitting alone in a small quiet room, facing "
     "the camera, the head and shoulders filling the picture. Within the first half second the mouth opens on the "
-    "first syllable. @VOICE@ (S1), says: <d>[Chinese] @LINE@</d> Exactly as the voice stops, the lips close and the "
+    "first syllable. @VOICE@ (S1), says: <d>[@LANG@] @LINE@</d> Exactly as the voice stops, the lips close and the "
     "jaw ceases all speaking motion. The jaw and lips move naturally with every syllable, and the picture holds on "
     "the speaker through the end of the video.\n\n"
     "overall_soundscape: A quiet, dry indoor room tone continues evenly throughout, with one soft breath just "
@@ -475,9 +547,10 @@ VOICE_TMPL = (
 )
 
 
-def h3_voice(voice_desc, line, seed, prefix):
-    """還沒有核可的對白可以剪音色時才用：fl2va、416×736、158 幀、simple 20 步，只解音訊（開頭不切，第一個字才不會被切掉）"""
-    prompt = VOICE_TMPL.replace("@VOICE@", voice_desc).replace("@LINE@", line)
+def h3_voice(voice_desc, line, seed, prefix, lang="Chinese"):
+    """還沒有核可的對白可以剪音色時才用：fl2va、416×736、158 幀、simple 20 步，只解音訊（開頭不切，第一個字才不會被切掉）
+    lang：<d> 標籤裡的語言（H3 官方格式的語言標記，規則核心 §6；非中文台詞要照實寫，例如 lang="English"，不能留預設值）"""
+    prompt = VOICE_TMPL.replace("@VOICE@", voice_desc).replace("@LINE@", line).replace("@LANG@", lang)
     return {
         "20": {"class_type": "UNETLoader", "inputs": {"unet_name": M["h3_fl2va"],
                                                       "weight_dtype": "default"}},

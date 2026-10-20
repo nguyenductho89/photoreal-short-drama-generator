@@ -70,6 +70,8 @@ Claude 照這個 skill 一站一站做；每一站做完整批交給你，你只
 
    選填：`lessons`／`series_state`（經驗庫、系列狀態檔）、`local_rules`（你自己的規則檔）、`official_guides`（MiniMax 官方提示詞指南）、`lint`（外部 lint）。
 
+   不想一直開著本機 GPU：`backend` 設 `"runpod"`，生成改送 RunPod Serverless（workers.max 平時 0，只收 Network Volume 的存放費），關卡、帳本、SHA 比對完全不變。設定、一次性佈署步驟、成本規則見 [`runpod/README.md`](runpod/README.md)；這時 `comfy_dir` 是本機一個空的鏡像資料夾（自己建 `input/`、`output/`），不是真的 ComfyUI 資料夾。
+
 3. 開著 ComfyUI，用設定裡的 Python 跑開工檢查，❌ 全部處理完：
 
    ```powershell

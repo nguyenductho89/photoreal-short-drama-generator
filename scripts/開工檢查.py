@@ -13,7 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_SLOTS = {
     "h3_ref2va": ("UNETLoader", "unet_name"), "h3_fl2va": ("UNETLoader", "unet_name"), "ace": ("UNETLoader", "unet_name"),
     "pdd_ref2va": ("MiniMaxH3PDDAccApply", "pdd_file"),
-    "qwen_image": ("UnetLoaderGGUF", "unet_name"),
+    "qwen_image": ("UNETLoader", "unet_name"),
     "h3_text_encoder": ("CLIPLoader", "clip_name"), "qwen_text_encoder": ("CLIPLoader", "clip_name"),
     "ace_text_encoder_1": ("DualCLIPLoader", "clip_name1"), "ace_text_encoder_2": ("DualCLIPLoader", "clip_name2"),
     "h3_video_vae": ("VAELoader", "vae_name"), "h3_audio_vae": ("VAELoader", "vae_name"),
@@ -24,7 +24,7 @@ PDD_MISSING = "正式檔位（PDD 8 步）跑不了，只能用備用的 base20�
 QWEN = "skill 不能自己生角色卡、場景卡、首幀，參考圖要自己準備"
 ACE = "不能生配樂"
 OPTIONAL = {"pdd_ref2va": PDD_MISSING, "MiniMaxH3PDDAccApply": PDD_MISSING,
-            "qwen_image": QWEN, "qwen_text_encoder": QWEN, "qwen_vae": QWEN, "UnetLoaderGGUF": QWEN,
+            "qwen_image": QWEN, "qwen_text_encoder": QWEN, "qwen_vae": QWEN,
             "ace": ACE, "ace_text_encoder_1": ACE, "ace_text_encoder_2": ACE, "ace_vae": ACE,
             "h3_fl2va": "不能用 h3_voice 生音色檔（從核可的對白剪就不需要），也不能用 I2VA"}
 COMFY_PY = "ComfyUI 可攜版是 python_embeded\\python.exe，桌面版和手動安裝通常是 ComfyUI 資料夾裡的 .venv\\Scripts\\python.exe"
@@ -85,23 +85,52 @@ else:
 if (C["max_frames"] - 5) % 17:
     say("❌", f"max_frames {C['max_frames']} 不在 17k+5 幀格上")
 else:
-    print("  ", f"單鏡最長 {C['max_frames']} 幀（{C['max_frames'] / 24:.2f} 秒）：正式解析度在這張顯卡量過的上限，換顯卡要重量")
+    print("  ", f"單鏡最長 {C['max_frames']} 幀（{C['max_frames'] / 24:.2f} 秒）：正式解析度在這張顯卡量過的上限，換顯卡要重量"
+                 + ("（RunPod 的卡沒重量過，先當上限，正式量產前按 runpod/README.md 重量）" if comfy.BACKEND == "runpod" else ""))
+
+# ---- backend=runpod 專屬：金鑰、endpoint、R2 ----
+if comfy.BACKEND == "runpod":
+    import rp
+    if os.environ.get("RUNPOD_API_KEY") and rp.EP:
+        say("✅", "RUNPOD_API_KEY、endpoint id 都有設")
+    else:
+        say("❌", "backend=runpod 要設環境變數 RUNPOD_API_KEY，和 RUNPOD_ENDPOINT_ID 或 設定.json 的 runpod.endpoint_id")
+    try:
+        say("✅", f"RunPod endpoint 活著：{rp.health()}")
+    except Exception as e:
+        say("❌", f"RunPod endpoint 連不上：{e}")
+    rp_cfg = C.get("runpod", {})
+    for k, v in (("R2_ENDPOINT（或 設定.runpod.r2_endpoint）", os.environ.get("R2_ENDPOINT") or rp_cfg.get("r2_endpoint")),
+                 ("R2_BUCKET（或 設定.runpod.r2_bucket）", os.environ.get("R2_BUCKET") or rp_cfg.get("r2_bucket")),
+                 ("環境變數 R2_ACCESS_KEY_ID", os.environ.get("R2_ACCESS_KEY_ID")),
+                 ("環境變數 R2_SECRET_ACCESS_KEY", os.environ.get("R2_SECRET_ACCESS_KEY"))):
+        say("✅" if v else "❌", k + ("" if v else "：沒設，backend=runpod 要靠它傳輸入/輸出檔"))
 
 # ---- ComfyUI、節點、模型 ----
-try:
-    st = json.load(urllib.request.urlopen(f"{comfy.BASE}/system_stats", timeout=10))
-    dev = st["devices"][0]
-    say("✅", f"ComfyUI {st['system'].get('comfyui_version', '')}｜{dev['name']}｜顯存 {dev['vram_total'] / 2**30:.0f} GB")
-except OSError as e:
-    say("❌", f"連不上 ComfyUI {comfy.BASE}（沒開？）：{e}")
+if comfy.BACKEND == "runpod":
+    try:
+        say("✅", f"object_info 快取有 {len(comfy._object_info_cache())} 個節點定義")
+        comfy_ok = True
+    except FileNotFoundError as e:
+        say("❌", str(e))
+        comfy_ok = False
 else:
+    try:
+        st = json.load(urllib.request.urlopen(f"{comfy.BASE}/system_stats", timeout=10))
+        dev = st["devices"][0]
+        say("✅", f"ComfyUI {st['system'].get('comfyui_version', '')}｜{dev['name']}｜顯存 {dev['vram_total'] / 2**30:.0f} GB")
+        comfy_ok = True
+    except OSError as e:
+        say("❌", f"連不上 ComfyUI {comfy.BASE}（沒開？）：{e}")
+        comfy_ok = False
+if comfy_ok:
     graphs = [comfy.h3_ref("", ["a.png"], ["a.wav"], 1, "x", end_frame="b.png", guide0=True, **comfy.PROFILES["formal"]),
               comfy.h3_ref("", ["a.png"], [], 1, "x", **comfy.PROFILES["base20"]), comfy.h3_i2v("", "a.png", 1, "x"),
               comfy.h3_voice("", "", 1, "x"), comfy.h3_vo("", "a.wav", 1, "x"), comfy.qwen_t2i("", 1, "x"),
               comfy.qwen_edit("", ["a.png"], 1, "x"), comfy.ace("", "", 1, "x")]
     info = {}
     for ct in sorted({n["class_type"] for g in graphs for n in g.values()}):
-        info.update(json.load(urllib.request.urlopen(f"{comfy.BASE}/object_info/{ct}", timeout=10)))
+        info.update(comfy.object_info(ct))
         if ct not in info:
             if ct in OPTIONAL:
                 say("⚠️", f"ComfyUI 少了節點 {ct}：{OPTIONAL[ct]}")
