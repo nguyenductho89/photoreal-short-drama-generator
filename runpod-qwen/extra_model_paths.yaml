@@ -6,3 +6,5 @@ runpod_volume:
   text_encoders: models/text_encoders/
   vae: models/vae/
   pdd_acc: models/pdd_acc/
+  checkpoints: models/checkpoints/
+  detection: models/detection/
