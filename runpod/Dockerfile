@@ -11,7 +11,11 @@
 # Build (máy Mac arm64 không build được image amd64/cuda; build bằng CI, xem README §2):
 #   docker buildx build --platform linux/amd64 -t <registry>/<tên>:<tag> --push runpod/
 
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+# cu130 (2026-10-28): ComfyUI 0.37.2 chỉ bật backend `cuda` của comfy_kitchen khi
+# torch.version.cuda >= 13 (comfy/quant_ops.py); DiT int8_convrot của H3 cần backend này,
+# không có thì chạy bằng `eager` (README Comfy-Org/MiniMax-H3: "prefer int8_convrot if you
+# are able to use pytorch with cu130"). Endpoint phải đặt gpu.minCudaVersion=13.0.
+FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
 
 ARG COMFYUI_VERSION=0.37.2
 ARG H3_PDD_ACC_COMMIT=311a65dd53832d8a5f8177a9d5fb923c09e35a90
@@ -29,7 +33,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CMAKE_BUILD_PARALLEL_LEVEL=8
 
 RUN apt-get update && apt-get install -y \
-    python3.12 python3.12-venv git wget \
+    python3.12 python3.12-venv python3.12-dev gcc git wget \
     libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 ffmpeg \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
     && ln -sf /usr/bin/pip3 /usr/bin/pip \
@@ -43,7 +47,7 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 # comfy-cli 版本固定：它決定怎麼裝 ComfyUI 和選 torch index，不固定版本會讓每次 build 的結果不一樣
 RUN uv pip install comfy-cli==1.13.0 pip setuptools wheel
-RUN /usr/bin/yes | comfy --workspace /comfyui install --version "${COMFYUI_VERSION}" --cuda-version 12.8 --nvidia
+RUN /usr/bin/yes | comfy --workspace /comfyui install --version "${COMFYUI_VERSION}" --cuda-version 13.0 --nvidia
 
 # 自訂節點：PDD 加速（正式檔位用）、KJNodes（SageAttention 的 PathchSageAttentionKJ patch
 # node，見 dramaclaw's generators/comfy_sage.py）、Context-Loop（MiniMax H3 Chain Audio
@@ -65,7 +69,7 @@ RUN git clone https://github.com/Jalen-Brunson/ComfyUI-MiniMax-H3-PDD-Acc /comfy
 # (~1.2MB/s) và nhiều gói CUDA to (500-600MB) tải đồng thời, default timeout làm uv báo lỗi giữa chừng
 ENV UV_HTTP_TIMEOUT=300
 RUN uv pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
-      --index-url https://download.pytorch.org/whl/cu128 \
+      --index-url https://download.pytorch.org/whl/cu130 \
     && uv pip install sageattention==1.0.6 \
     && uv pip install -r /comfyui/requirements.txt \
     && for r in /comfyui/custom_nodes/*/requirements.txt; do \
@@ -75,6 +79,7 @@ RUN uv pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
 # build 時就把 ComfyUI 整個 import 一次（CPU 跑就好）：啟動會死的相依問題在這裡就爆出來，
 # 不要等到正式 worker 才看到一句看不出原因的「server not reachable」
 RUN cd /comfyui && timeout 300 python main.py --quick-test-for-ci --cpu
+RUN python -c "import torch, triton, sageattention; assert torch.version.cuda.startswith('13'), torch.version.cuda; print(torch.__version__, torch.version.cuda, triton.__version__)"
 
 WORKDIR /comfyui
 ADD extra_model_paths.yaml ./
