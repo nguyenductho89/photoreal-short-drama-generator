@@ -28,7 +28,11 @@ echo "worker-h3 短劇：GPU 可用 — $GPU_CHECK"
 COMFY_PID_FILE="/tmp/comfyui.pid"
 
 echo "worker-h3 短劇：啟動 ComfyUI"
-python -u /comfyui/main.py --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout &
+# COMFY_EXTRA_ARGS: cờ ComfyUI tuỳ chọn đặt qua env của endpoint, vd
+# "--enable-triton-backend --use-sage-attention". Cố ý không quote để tách thành nhiều cờ.
+echo "worker-h3 短劇：COMFY_EXTRA_ARGS=${COMFY_EXTRA_ARGS:-<none>}"
+# shellcheck disable=SC2086
+python -u /comfyui/main.py --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout ${COMFY_EXTRA_ARGS} &
 echo $! > "$COMFY_PID_FILE"
 
 echo "worker-h3 短劇：啟動 RunPod handler"
