@@ -8,3 +8,4 @@ runpod_volume:
   pdd_acc: models/pdd_acc/
   checkpoints: models/checkpoints/
   detection: models/detection/
+  frame_interpolation: models/frame_interpolation/
